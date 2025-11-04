@@ -48,6 +48,14 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       k_t = tmp_k_t;
     }
 
+    // Prefetch next K/V to SRAM to overlap IO with compute
+    if (i + 1 < keys.size()) {
+      if (keys[i + 1]->GetPosition() != kInSharedMemory)
+        gpu_sim.MoveMatrixToSharedMem(keys[i + 1]);
+      if (values[i + 1]->GetPosition() != kInSharedMemory)
+        gpu_sim.MoveMatrixToSharedMem(values[i + 1]);
+    }
+
     // scores = Q * K^T  -> (i+1 x i+1)
     Matrix *scores = matrix_memory_allocator.Allocate("scores");
     gpu_sim.MatMul(current_query, k_t, scores);
