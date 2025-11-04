@@ -6,43 +6,44 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
                Rater &rater, GpuSimulator &gpu_sim,
                MatrixMemoryAllocator matrix_memory_allocator) {
   assert(keys.size() == values.size());
+  // Maintain growing stacks across rounds to avoid rebuilding
+  Matrix *k_stack = nullptr;
+  Matrix *v_stack = nullptr;
   for (size_t i = 0; i < keys.size(); ++i) {
     Matrix *current_query = rater.GetNextQuery();
 
     // Ensure operands are in SRAM for compute
     if (current_query->GetPosition() != kInSharedMemory)
       gpu_sim.MoveMatrixToSharedMem(current_query);
-    for (size_t j = 0; j <= i; ++j) {
-      if (keys[j]->GetPosition() != kInSharedMemory)
-        gpu_sim.MoveMatrixToSharedMem(keys[j]);
-      if (values[j]->GetPosition() != kInSharedMemory)
-        gpu_sim.MoveMatrixToSharedMem(values[j]);
-    }
+    if (keys[i]->GetPosition() != kInSharedMemory)
+      gpu_sim.MoveMatrixToSharedMem(keys[i]);
+    if (values[i]->GetPosition() != kInSharedMemory)
+      gpu_sim.MoveMatrixToSharedMem(values[i]);
 
-    // Stack keys into K (i+1 x d)
-    Matrix *k_stack = matrix_memory_allocator.Allocate("k_stack");
-    gpu_sim.Copy(keys[0], k_stack, kInSharedMemory);
-    for (size_t j = 1; j <= i; ++j) {
-      Matrix *tmp = matrix_memory_allocator.Allocate("k_stack_tmp");
-      gpu_sim.Concat(k_stack, keys[j], tmp, /*axis=*/0, kInSharedMemory);
+    // Grow K and V stacks incrementally (each is (i+1) x d)
+    if (i == 0) {
+      k_stack = matrix_memory_allocator.Allocate("k_stack");
+      gpu_sim.Copy(keys[0], k_stack, kInSharedMemory);
+      v_stack = matrix_memory_allocator.Allocate("v_stack");
+      gpu_sim.Copy(values[0], v_stack, kInSharedMemory);
+    } else {
+      Matrix *tmp_k = matrix_memory_allocator.Allocate("k_stack_tmp");
+      gpu_sim.Concat(k_stack, keys[i], tmp_k, /*axis=*/0, kInSharedMemory);
       gpu_sim.ReleaseMatrix(k_stack);
-      k_stack = tmp;
-    }
+      k_stack = tmp_k;
 
-    // Stack values into V (i+1 x d)
-    Matrix *v_stack = matrix_memory_allocator.Allocate("v_stack");
-    gpu_sim.Copy(values[0], v_stack, kInSharedMemory);
-    for (size_t j = 1; j <= i; ++j) {
-      Matrix *tmp = matrix_memory_allocator.Allocate("v_stack_tmp");
-      gpu_sim.Concat(v_stack, values[j], tmp, /*axis=*/0, kInSharedMemory);
+      Matrix *tmp_v = matrix_memory_allocator.Allocate("v_stack_tmp");
+      gpu_sim.Concat(v_stack, values[i], tmp_v, /*axis=*/0, kInSharedMemory);
       gpu_sim.ReleaseMatrix(v_stack);
-      v_stack = tmp;
+      v_stack = tmp_v;
     }
 
     // scores = Q * K^T  -> (i+1 x i+1)
-    gpu_sim.Transpose(k_stack, kInSharedMemory);
+    Matrix *k_t = matrix_memory_allocator.Allocate("k_t");
+    gpu_sim.Copy(k_stack, k_t, kInSharedMemory);
+    gpu_sim.Transpose(k_t, kInSharedMemory);
     Matrix *scores = matrix_memory_allocator.Allocate("scores");
-    gpu_sim.MatMul(current_query, k_stack, scores);
+    gpu_sim.MatMul(current_query, k_t, scores);
 
     // For each row: softmax(row) * V -> output
     Matrix *ans = nullptr;
@@ -74,9 +75,8 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       gpu_sim.ReleaseMatrix(row_out);
     }
 
-    // Cleanup
-    gpu_sim.ReleaseMatrix(k_stack);
-    gpu_sim.ReleaseMatrix(v_stack);
+    // Cleanup temps of this round
+    gpu_sim.ReleaseMatrix(k_t);
     gpu_sim.ReleaseMatrix(scores);
 
     // Move answer to HBM, run, then commit
@@ -84,6 +84,9 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     gpu_sim.Run(false, &matrix_memory_allocator);
     rater.CommitAnswer(*ans);
   }
+  // Release persistent stacks
+  if (k_stack) gpu_sim.ReleaseMatrix(k_stack);
+  if (v_stack) gpu_sim.ReleaseMatrix(v_stack);
 }
 
 void Test(Rater &rater, GpuSimulator &gpu_sim,
