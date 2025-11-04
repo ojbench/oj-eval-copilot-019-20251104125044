@@ -56,25 +56,21 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
         gpu_sim.MoveMatrixToSharedMem(values[i + 1]);
     }
 
-    // scores = Q * K^T  -> (i+1 x i+1)
-    Matrix *scores = matrix_memory_allocator.Allocate("scores");
-    gpu_sim.MatMul(current_query, k_t, scores);
-
-    // Compute exp once for all rows
-    Matrix *scores_exp = matrix_memory_allocator.Allocate("scores_exp");
-    gpu_sim.MatExp(scores, scores_exp);
-
-    // For each row: softmax(row) * V -> output
+    // For each row: compute scores = q_r * K^T, then softmax and multiply V
     Matrix *ans = nullptr;
     for (size_t r = 0; r <= i; ++r) {
+      Matrix *row_q = matrix_memory_allocator.Allocate("row_q");
+      gpu_sim.GetRow(current_query, r, row_q, kInSharedMemory);   // 1 x d
+      Matrix *row_scores = matrix_memory_allocator.Allocate("row_scores");
+      gpu_sim.MatMul(row_q, k_t, row_scores);                     // 1 x (i+1)
       Matrix *row_exp = matrix_memory_allocator.Allocate("row_exp");
-      gpu_sim.GetRow(scores_exp, r, row_exp, kInSharedMemory);  // 1 x (i+1)
+      gpu_sim.MatExp(row_scores, row_exp);                        // 1 x (i+1)
       Matrix *den = matrix_memory_allocator.Allocate("den");
-      gpu_sim.Sum(row_exp, den);                                 // 1 x 1
+      gpu_sim.Sum(row_exp, den);                                   // 1 x 1
       Matrix *weights = matrix_memory_allocator.Allocate("weights");
-      gpu_sim.MatDiv(row_exp, den, weights);                     // 1 x (i+1)
+      gpu_sim.MatDiv(row_exp, den, weights);                       // 1 x (i+1)
       Matrix *row_out = matrix_memory_allocator.Allocate("row_out");
-      gpu_sim.MatMul(weights, v_stack, row_out);                 // 1 x d
+      gpu_sim.MatMul(weights, v_stack, row_out);                   // 1 x d
 
       if (r == 0) {
         ans = matrix_memory_allocator.Allocate("ans");
@@ -85,6 +81,8 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
         gpu_sim.ReleaseMatrix(ans);
         ans = tmp_ans;
       }
+      gpu_sim.ReleaseMatrix(row_q);
+      gpu_sim.ReleaseMatrix(row_scores);
       gpu_sim.ReleaseMatrix(row_exp);
       gpu_sim.ReleaseMatrix(den);
       gpu_sim.ReleaseMatrix(weights);
@@ -92,8 +90,6 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     }
 
     // Cleanup temps of this round
-    gpu_sim.ReleaseMatrix(scores);
-    gpu_sim.ReleaseMatrix(scores_exp);
 
     // Move answer to HBM, run, then commit
     gpu_sim.MoveMatrixToGpuHbm(ans);
